@@ -1,0 +1,144 @@
+---
+title: "Rossmann Feature Exploration"
+output: html_document
+---
+
+```{r, echo=FALSE}
+setwd("C:\\Users\\Tom\\Desktop\\projects\\rossmann")
+```
+
+```{r, message=FALSE}
+require(ggplot2)
+require(hexbin)
+require(dplyr)
+require(memisc)
+require(rpart)
+require(rpart.plot)
+require(randomForest)
+require(xgboost)
+```
+
+```{r}
+# Read in preprocessed data.
+set.seed(1337)
+clean = read.csv("data/clean.csv")
+clean$Store = factor(clean$Store)
+clean$DayOfWeek = factor(clean$DayOfWeek)
+clean$Promo = factor(clean$Promo)
+clean$SchoolHoliday = factor(clean$SchoolHoliday)
+clean$Promo2 = factor(clean$Promo2)
+clean$Date.DayOfMonth = factor(clean$Date.DayOfMonth)
+clean$Date.Month = factor(clean$Date.Month)
+clean$CompetitionOpened = factor(clean$CompetitionOpened)
+clean$Promo2Begun = factor(clean$Promo2Begun)
+```
+
+Feature-Feature Exploration
+===========================
+
+It should be noted here, that many NA values for Competition Tenure / Distance and Promo2 Tenure have been set equal to the median, and should be considered when comparing features.
+
+Although we can't know customer count in the future, we can look at the correlation of customer count and sales.
+```{r, echo=FALSE, message=FALSE}
+ggplot(aes(x=Customers, y=Sales), data=clean) + 
+  stat_binhex(color='white') +
+  scale_x_log10() +
+  scale_y_log10()
+```
+```{r, echo=FALSE, message=FALSE}
+ggplot(aes(x=Customers, y=Sales), data=sample(clean, floor(length(clean$Sales)/100))) +
+  geom_point(alpha=1/15) +
+  geom_smooth() +
+  ggtitle("Sales v. Customers (log-log, 1% of data)") +
+  scale_x_log10() +
+  scale_y_log10()
+```
+
+
+Let's see how average sales compare on holidays and non-holidays when the store was still opened.
+```{r}
+tapply(clean$Sales, clean$SchoolHoliday, summary)
+```
+```{r, echo=FALSE}
+ggplot(aes(x=StateHoliday, y=Sales), data=clean) +
+  geom_boxplot()
+```
+
+Store sales appear to increase when stores are open during the holidays.
+
+How do sales vary with date and month?
+```{r, echo=FALSE, message=FALSE}
+# Day of the week
+#tapply(clean$Sales, clean$DayOfWeek, sd)
+#tapply(clean$Sales, clean$DayOfWeek, summary)
+ggplot(aes(x=DayOfWeek, y=Sales), data=clean) +
+  geom_boxplot() +
+  coord_cartesian(ylim=c(0, 20000))
+# Day of Month
+ggplot(aes(x=Date.DayOfMonth, y=Sales), data=clean) +
+  geom_boxplot() +
+  coord_cartesian(ylim=c(0, 20000))
+# Month
+ggplot(aes(x=Date.Month, y=Sales), data=clean) +
+  geom_boxplot() +
+  coord_cartesian(ylim=c(0, 20000))
+```
+
+Stores are not open on Sunday (7), and sales show the largest spread.  Mondays (1) have the greatest median sales ($7540), and Saturdays (6) have the smallest median sales ($5430).  Rossmannn stores have the best sales in the month of September.
+
+
+How does sales vary with promotions?
+```{r}
+# Promo
+tapply(clean$Sales, clean$Promo, summary)
+# Promo2
+tapply(clean$Sales, clean$Promo2, summary)
+```
+```{r, echo=FALSE, message=FALSE}
+# Promo2 Tenure
+ggplot(aes(x=Promo2Tenure, y=Sales), data=sample(clean, floor(length(clean$Sales)/100))) +
+  geom_point(alpha=1/15) +
+  geom_smooth() +
+  ggtitle("Sales v. Promo2Tenure (1% of data)") +
+  scale_y_log10()
+
+# PromoInterval
+ggplot(aes(x=PromoInterval, y=Sales), data=clean) +
+  geom_boxplot() +
+  coord_cartesian(ylim=c(0, 20000))
+```
+
+While a promotion is going on, sales are up considerably (median $7550 compared to $5460).  On the other hand, stores running continual Promo2 have lower sales ($6075) than those not running Promo2 ($6685).
+
+
+How does sales vary with store type and assortment?
+```{r, echo=FALSE}
+#tapply(clean$Sales, clean$StoreType, summary)
+#table(clean$StoreType)
+ggplot(aes(x=StoreType, y=Sales), data=clean) +
+  geom_boxplot() +
+  coord_cartesian(ylim=c(0, 20000))
+#tapply(clean$Sales, clean$Assortment, summary)
+#table(clean$Assortment)
+ggplot(aes(x=Assortment, y=Sales), data=clean) +
+  geom_boxplot() +
+  coord_cartesian(ylim=c(0, 20000))
+```
+
+Store type-b is rare, but has the highest median sales.  The other store types are comparable in sales.  Likewise, stores with "extra" assortment are rare but have higher sales. "Extendend" stores are second highest in sales followed by "basic".
+
+Finally, lets look at the effects of competition.
+```{r, echo=FALSE}
+ggplot(aes(x=LogCompetitionDistance, y=Sales), data=sample(clean, floor(length(clean$Sales)/20))) +
+  geom_point(alpha=1/15) +
+  geom_smooth() +
+  ggtitle("Sales v. Competition Distance (5% of data)")
+
+ggplot(aes(x=CompetitionTenure, y=Sales), data=sample(clean, floor(length(clean$Sales)/20))) +
+  geom_point(alpha=1/15) +
+  geom_smooth() +
+  ggtitle("Sales v. Competition Tenure (5% of data)")
+
+tapply(clean$Sales, clean$CompetitionOpened, summary)
+```
+Competition Distance doesn't appear to be a large factor, and neither does Competition Tenure.

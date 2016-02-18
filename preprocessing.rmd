@@ -1,0 +1,369 @@
+---
+title: "Rossmann Store Sales"
+author: "Tom Hettinger"
+date: "January 31, 2016"
+output: html_document
+---
+
+Description
+===========
+The goal if this project is to explore a data set containing past sales and store information from Rossmann stores, and generate prediction models to forecast future sales earnings.  The project description below and more information can be found on the kaggle website at <https://www.kaggle.com/c/rossmann-store-sales.>
+
+
+> Rossmann operates over 3,000 drug stores in 7 European countries. Currently, 
+Rossmann store managers are tasked with predicting their daily sales for up to six weeks in advance. Store sales are influenced by many factors, including promotions, competition, school and state holidays, seasonality, and locality. With thousands of individual managers predicting sales based on their unique circumstances, the accuracy of results can be quite varied.
+>
+> In their first Kaggle competition, Rossmann is challenging you to predict 6 weeks of daily sales for 1,115 stores located across Germany. Reliable sales forecasts enable store managers to create effective staff schedules that increase productivity and motivation. By helping Rossmann create a robust prediction model, you will help store managers stay focused on what’s most important to them: their customers and their teams!
+
+
+The following packages were used in this project:
+
+```{r, message=FALSE}
+require(ggplot2)
+require(hexbin)
+require(dplyr)
+require(memisc)
+```
+
+***
+Data Preprocessing
+==================
+```{r, echo=FALSE}
+setwd("C:\\Users\\Tom\\Desktop\\projects\\rossmann")
+```
+
+We begin by reading in the training data, store data, and test data.
+```{r}
+set.seed(1337)
+store = read.csv("data/store.csv")
+train = read.csv("data/train.csv")
+#test = read.csv("data/test.csv")
+```
+
+### Looking at store.csv
+
+The Store data set contains a description of the 1,115 stores, including parameters such as a store ID (1 through 1115), store type, distance to competitors, and whether stores participated in continuous promotional campaigns.
+
+```{r}
+str(store)
+```
+
+Field | Description
+----- | -----------
+Store | unique store ID ranging from 1 to 1115
+StoreType | classification of 4 different store models: "a", "b", "c", or "d"
+Assortment | describes an assortment level: "a"=basic, "b"=extra, or "c"=extended
+CompetitionDistance | distance in meters to the nearest competitor
+CompetitionOpenSinceMonth | month in which nearest competitor opened
+CompetitionOpenSinceYear | year in which nearest competitor opened
+Promo2 | a continuing and consecutive promotion that a store may (1) or may not (0) be running
+Promo2SinceWeek | week in which the store began Promo2
+Promo2SinceYear | year in which the store began Promo2
+PromoInterval | describes the intervals in which Promo2 rounds begin.  For example, "Feb,May,Aug,Nov" means that each round starts in the months of February, May, August, and November
+
+
+```{r}
+summary(store$StoreType)
+```
+Most stores are of type "a", with only a small number of type "b" stores.
+
+```{r}
+summary(store$Assortment)
+```
+Store assortments are either "basic" or "extendend", with the exception of 9 stores with "extra"" assortment.
+
+```{r}
+summary(store$CompetitionDistance)
+```
+Competitor stores range from 20 m to over 75 km from the Rossman stores, with a median distance of 2.3 km.
+
+```{r, echo=FALSE}
+ggplot(aes(x=CompetitionDistance), data=store) +
+  geom_histogram(na.rm=TRUE, fill="dodgerblue", color='grey', position="identity") +
+  scale_y_log10() +
+  scale_x_log10() +
+  xlab("Distance to Competitor (m)") +
+  ggtitle("Distribution of Competitor Distances")
+```
+
+```{r}
+summary(store$CompetitionOpenSinceYear)
+head(sort(store$CompetitionOpenSinceYear))
+```
+
+All but 2 (excluding NA) competitor stores opened in, or after, 1990.  Ignoring the the two stores from 1900 and 1961:
+
+```{r, echo=FALSE}
+ggplot(aes(x=CompetitionOpenSinceYear), data=store) +
+  geom_histogram(binwidth=1, na.rm=TRUE, fill="dodgerblue", color='grey', position="identity", origin=1990) +
+  scale_x_continuous(breaks=seq(1990, 2015, 5)) +
+  xlab("Year when Competitor Opened") +
+  ggtitle("Distribution of Competitor Openening Years")
+```
+
+
+```{r}
+summary(factor(store$Promo2))
+summary(store$Promo2SinceYear)
+```
+```{r, echo=FALSE}
+ggplot(aes(Promo2SinceYear), data=store) +
+  geom_histogram(color='grey', fill='dodgerblue', origin=2008.5, binwidth=1) +
+  scale_x_continuous(breaks=c(2009, 2010, 2011, 2012, 2013, 2014, 2015)) +
+  xlab('Promo2 Starting Year')
+```
+```{r}
+summary(store$PromoInterval)
+```
+
+About half of the stores run continuous / consecutive promotions.  Those that do, have a MODE interval of "Jan,Apr,Jul,Oct".
+
+```{r, echo=FALSE, message=FALSE}
+# Stacked bar graph of non promo2 and promo2
+ggplot(aes(factor(Promo2)), data=store) +
+  geom_bar(aes(fill=PromoInterval)) +
+  scale_x_discrete(labels=c("Not Participating", "Participating")) +
+  scale_fill_discrete(labels=c('No Promotion', levels(store$PromoInterval)[2:4]), name="Interval") +
+  xlab("Promo2 Participation")
+```
+
+
+### Looking at train.csv
+
+The training data set contains a sales information from stores on various days.
+
+```{r}
+str(train)
+```
+
+Field | Description
+----- | -----------
+Store | store ID number
+DayOfWeek | the day of the week (1-7) (Monday - Sunday)
+Date | date of information
+Sales | the turnover for this day in this store (what we are trying to predict)
+Customers | number of customers in any given day (something we could also predict if we wanted)
+Open | whether the store was open (1) or closed (0)
+Promo | whether a store is running a promotion this day (not sure if this is related to Promo2)
+StateHoliday | indicates a state holiday (usually stores are closed). "a"=public holiday, "b"=Easter, "c"=Christmas", 0=None"
+SchoolHoliday | whether (1) or not (0) a store is affected by closure of public schools
+
+
+```{r, echo=FALSE}
+ggplot(aes(Store), data=train) +
+  geom_histogram(color='grey', fill='dodgerblue', origin=1, bins=24) +
+  xlab('Store ID')
+```
+
+The 1,115 stores appear to be sampled uniformly, as does the day of week for the most part:
+
+```{r}
+summary(factor(train$DayOfWeek))
+```
+
+```{r}
+summary(as.Date(train$Date))
+length(unique(train$Date))
+```
+Observations have coverage in time is fairly uniform from Jan 01, 2013 through Jul 07, 2015, with a small deficiency in the second half of 2014.
+```{r, echo=FALSE}
+ggplot(aes(as.Date(Date)), data=train) +
+  geom_histogram(color='grey', fill='dodgerblue', binwidth=30.4, origin=as.numeric(as.Date("2013-01-01"))) +
+  xlab("Date of Observation")
+```
+
+
+```{r}
+summary(train$Sales)
+summary(train$Sales[train$Open == 1])
+```
+Median sales for an open store was $6369 per day.  Sales = $0.00 when store is closed.
+```{r, echo=FALSE, message=FALSE}
+ggplot(aes(Sales), data=subset(train, train$Open == 1)) +
+  geom_histogram(color='grey', fill='dodgerblue') +
+  xlab('Sales (dollars)') +
+  scale_x_log10()
+```
+
+
+```{r}
+summary(train$Customers)
+summary(train$Customers[train$Open == 1])
+```
+Median customer count is 676.  Future customer count is uknown, so we cannot use it in our model.
+```{r, echo=FALSE, message=FALSE}
+ggplot(aes(Customers), data=subset(train, train$Open == 1)) +
+  geom_histogram(color='grey', fill='dodgerblue') +
+  xlab('Customers per day') +
+  scale_x_log10()
+```
+
+```{r}
+summary(factor(train$Open))
+1 - (sum(train$Open) / length(train$Open))
+```
+17% of the data includes days when the store is closed.  These will always have $0 in sales, so we do not need to predict these in our model.  We should remove them.
+
+```{r}
+summary(factor(train$Promo))
+summary(factor(train$Promo[train$Open == 1]))
+```
+Most of the time the store is open, there are no promotions running.
+
+```{r}
+summary(train$StateHoliday)
+table(train$StateHoliday, train$Open)
+```
+
+```{r}
+summary(factor(train$SchoolHoliday))
+table(train$SchoolHoliday, train$Open)
+```
+
+```{r}
+open_no_holiday = train$Open[train$StateHoliday == 0 & train$SchoolHoliday == 0]
+length(open_no_holiday)
+sum(open_no_holiday)
+sum(open_no_holiday) / length(open_no_holiday)
+rm(open_no_holiday)
+```
+814,000 of the 1,000,000 observations do not occur on a holiday.  Of those observations that were not holidays, the stores were only opened 83% of the time.
+```{r}
+summary(factor(train$DayOfWeek[train$StateHoliday == 0 & train$SchoolHoliday == 0 & train$Open == 0]))
+```
+These dates of closure are usually on a Sunday.
+```{r}
+table(train$DayOfWeek, train$Open)
+length(unique(train$Store[train$DayOfWeek == 7 & train$Open == 1]))
+length(unique(train$Date[train$DayOfWeek == 7 & train$Open == 1]))
+```
+Rossman stores almost never open on Sundays.
+
+
+
+### Fixing data types and imputing values
+
+First we do a left join of the training set with the store dataframe on store ID, so that we have store information for every observation.
+
+```{r}
+clean = train
+clean = merge(clean, store, by="Store", all.x=TRUE)
+```
+
+We should transform competitor distance by taking the log since the distances span a large range.
+```{r}
+clean$LogCompetitionDistance = log10(clean$CompetitionDistance)
+```
+
+
+We can extrate the Month and Day-of-Month from the original date, and set them as categorical factors.  We will use the Year as a continuous variable.
+```{r}
+clean$Date.DayOfMonth = factor(format(as.Date(train$Date, "%Y-%m-%d"), "%d"))
+clean$Date.Month = factor(format(as.Date(train$Date, "%Y-%m-%d"), "%m"))
+clean$Date.Year = as.numeric(format(as.Date(train$Date, "%Y-%m-%d"), "%Y"))
+clean$DayOfWeek = factor(train$DayOfWeek)
+clean$Date = as.Date(clean$Date)
+```
+
+Lets transform the year that the nearest competitor opened, to the number of days that the competitor as been around, so that our model isn't time dependent.
+```{r}
+clean$CompetitionOpenDate = as.Date(paste(clean$CompetitionOpenSinceYear, clean$CompetitionOpenSinceMonth, "01", sep="-"))
+clean$CompetitionTenure = clean$Date - clean$CompetitionOpenDate
+clean$CompetitionTenure = as.numeric(clean$CompetitionTenure, units = "days")
+summary(clean$CompetitionTenure)
+```
+Some observations include points from before the competitor opened up (negative Tenure). We'll handle this in a bit.
+```{r, echo=FALSE, message=FALSE}
+ggplot(aes(CompetitionTenure / 365), data=clean) +
+  geom_histogram(fill='dodgerblue', color='grey', origin=-10, binwidth=5) +
+  xlab("Competition Tenure (years) for ALL Observations") +
+  scale_x_continuous(breaks=seq(0, 120, 10))
+```
+
+
+We can similarly transform Promo2Since Week and Year into a Promo2Tenure feature that says how long the Promo2 has been going on for.
+```{r}
+clean$Promo2StartDate = as.numeric(as.Date(paste(clean$Promo2SinceYear, "01", "01"), format="%Y %m %d"), units="days")
+clean$Promo2StartDate = clean$Promo2StartDate + (7 * (clean$Promo2SinceWeek-1))
+clean$Promo2Tenure = as.numeric(clean$Date - clean$Promo2StartDate, units="days")
+summary(clean$Promo2Tenure)
+```
+Some observations also have negative Tenure for Promo2.
+```{r, echo=FALSE, message=FALSE}
+ggplot(aes(Promo2Tenure / 365), data=clean) +
+  geom_histogram(color="grey", fill="dodgerblue") +
+  xlab("Promo2 Tenure (years)")
+```
+
+We will also remove the observations for which Open == 0, since we do not care about sales on days the stores were closed.
+```{r}
+clean = subset(clean, Open != 0)
+clean$Open = NULL
+```
+
+StoreID is an important features, since we expect high-grossing stores to have higher sales than smaller stores.  Having 1,115 unique levels for a category is computationally intense though.  Therefore, we will introduce a new feature, "MedianOfSales", which contains the median value of all sales for a particular store.  This data leak will mean our training set and evaluation scores will be overestimating the true validation scores obtained from the holdout set.
+```{r}
+store_medians = summarise(group_by(clean, Store), median(Sales))
+names(store_medians)[2] <- "MedianSales"
+clean = merge(clean, store_medians, by="Store", all.x=TRUE)
+
+store_means = summarise(group_by(clean, Store), mean(Sales))
+names(store_means)[2] <- "MeanSales"
+clean = merge(clean, store_means, by="Store", all.x=TRUE)
+
+rm(store_medians)
+rm(store_means)
+```
+
+We can now remove uncessary Date information.  We are removing the Year of observation, since this causes our model to be time-dependent.  We want to successfully predict future sales, so we should remove the Year of observation.
+```{r}
+clean$CompetitionOpenSinceYear = NULL
+clean$CompetitionOpenSinceMonth = NULL
+clean$CompetitionOpenDate = NULL
+clean$Date = NULL
+clean$Date.Year = NULL
+clean$Promo2StartDate = NULL
+clean$Promo2SinceWeek = NULL
+clean$Promo2SinceYear = NULL
+```
+
+
+Which columns have NA values?
+```{r}
+colSums(is.na(clean))
+```
+
+Competition Distance: Let's use the median value for imputing.
+```{r}
+# Replace NA with median
+clean$LogCompetitionDistance[is.na(clean$LogCompetitionDistance)] <- median(clean$LogCompetitionDistance, na.rm=TRUE)
+```
+
+
+Competition Tenure - Let's use the median value here as well.  Additionally, it may be unkown if a competitor is opening in the future, so we should set all negative values to the median (negative values excluded).  We'll also introduce a feature "competitionOpened" and set to False where the tenure is negative.
+```{r}
+# Create feature describing if a competitor is known to be opened.
+clean$CompetitionOpened <- clean$CompetitionTenure >= 0
+clean$CompetitionOpened[is.na(clean$CompetitionOpened)] <- FALSE
+# Replace negative Tenures with NA
+clean$CompetitionTenure[clean$CompetitionTenure < 0] <- NA
+# Replace all NAs with median
+clean$CompetitionTenure[is.na(clean$CompetitionTenure)] <- median(clean$CompetitionTenure, na.rm=TRUE)
+```
+
+Promo2Tenure - Same logic from competition tenure applies to promo2 tenure.
+```{r}
+# Create feature describing if promo2 is known to begin
+clean$Promo2Begun <- clean$Promo2Tenure >= 0
+clean$Promo2Begun[is.na(clean$Promo2Begun)] <- FALSE
+# Replace negative with NA
+clean$Promo2Tenure[clean$Promo2Tenure < 0] <- NA
+# Replace all NA with median
+clean$Promo2Tenure[is.na(clean$Promo2Tenure)] <- median(clean$Promo2Tenure, na.rm=TRUE)
+```
+
+```{r}
+# Write cleaned data to CSV
+write.csv(clean, file="data/clean.csv")
+```
+

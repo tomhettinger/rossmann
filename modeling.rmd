@@ -1,0 +1,323 @@
+---
+title: "Rossmann Sales Forecasting"
+output: html_document
+---
+
+```{r, echo=FALSE}
+setwd("C:\\Users\\Tom\\Desktop\\projects\\rossmann")
+```
+
+```{r, message=FALSE}
+require(ggplot2)
+require(hexbin)
+require(dplyr)
+require(memisc)
+require(rpart)
+require(rpart.plot)
+require(randomForest)
+require(xgboost)
+```
+
+```{r}
+# Read in preprocessed data.
+set.seed(1337)
+clean = read.csv("data/clean.csv")
+clean$Store = factor(clean$Store)
+clean$DayOfWeek = factor(clean$DayOfWeek)
+clean$Promo = factor(clean$Promo)
+clean$SchoolHoliday = factor(clean$SchoolHoliday)
+clean$Promo2 = factor(clean$Promo2)
+clean$Date.DayOfMonth = factor(clean$Date.DayOfMonth)
+clean$Date.Month = factor(clean$Date.Month)
+clean$CompetitionOpened = factor(clean$CompetitionOpened)
+clean$Promo2Begun = factor(clean$Promo2Begun)
+```
+
+
+Building Models
+====================
+
+Before we build our models, we should consider validation.  One option would be to use k-folding of the 'clean' data set as a method of cross-validation, in order to determerine the performance of our models.  For simplicity here, we will divide the clean data into three parts: 1) a training set (70%) for building models; 2) a validation set (15%) for validating models; and 3) a holdout set (15%) to be used as a final metric for testing the performance of the final model.
+
+```{r}
+mask = sample(1:nrow(clean), size=floor(0.7 * nrow(clean)))
+trainingSet = clean[mask,]
+validate_holdout = clean[-mask,]
+
+mask2 = sample(1:nrow(validate_holdout), size=floor(0.5 * nrow(validate_holdout)))
+validateSet = validate_holdout[mask2,]
+holdoutSet = validate_holdout[-mask2,]
+
+print(dim(trainingSet))
+print(dim(validateSet))
+print(dim(holdoutSet))
+
+rm(mask)
+rm(mask2)
+rm(validate_holdout)
+rm(train)
+rm(store)
+rm(clean)
+```
+
+We shold also define some functions here, including our metrics for measuring model validity.  According to the Kaggle competition, the goal is to reduce the Root Mean Square Percentage Error (RMSPE):
+
+$$\rm{RMSPE} = \sqrt{ \frac{1}{n} \sum_{i=1}^{n} \left( \frac{y_i - \hat{y}_i}{y_i} \right)^2 }$$
+
+where $y_i$ are actual sales and $\hat{y}_i$ are predictions.  Let's define the function right now.
+```{r}
+rmspe <- function (predictions, true_values) {
+  percent_errors = (true_values - predictions) / true_values
+  percent_errors[is.infinite(percent_errors)] <- NA
+  avg_percent_errors = mean(percent_errors * percent_errors, na.rm=TRUE)
+  return(sqrt(avg_percent_errors))
+  }
+```
+
+
+
+### Linear Regression
+
+Linear regression models are fast and highly interpretable, so we will begin with one of these.  Lets start with a simple model using a couple of features, then build on it.  We have standardized the continuous features to make importance comparisons more direct when looking at the coefficients.
+
+```{r}
+linear_model_01 <- lm(data = trainingSet, 
+                      formula = Sales ~ DayOfWeek + Date.Month + Date.DayOfMonth + Promo)
+summary(linear_model_01)
+
+predictions_model_01 <- predict(linear_model_01, validateSet)
+lm01_rmspe = rmspe(predictions_model_01, validateSet$Sales)
+print(lm01_rmspe)
+```
+This very simple model with only 4 features has a RMSPE = 0.52  Let's add in more features and improve the linear model.
+
+```{r}
+linear_model_02 <- update(linear_model_01, 
+                          ~ . + scale(LogCompetitionDistance) + scale(CompetitionTenure) + CompetitionOpened + Promo2 + PromoInterval + scale(Promo2Tenure) + Promo2Begun + StateHoliday + SchoolHoliday + StoreType + Assortment)
+
+predictions_model_02 <- predict(linear_model_02, validateSet)
+lm02_rmspe = rmspe(predictions_model_02, validateSet$Sales)
+print(lm02_rmspe)
+```
+This improves the linear model only slightly, to RMSPE = 0.50.  
+
+One feature that we have not included yet is the StoreID.  Since the sales will likely depend strongly on the average sales for a particular, this is expected to be a very strong feature.  Considering the large number of StoreIDs, we instead use the mean sales for a particular storeID.  Practically speaking, when predicting future sales, we will still have these past sales records, so these should be used in our model.
+
+```{r}
+linear_model_03 <- lm(data = trainingSet,
+                      formula = Sales ~ DayOfWeek + Date.Month + Date.DayOfMonth + Promo + scale(LogCompetitionDistance) + scale(CompetitionTenure) + CompetitionOpened + Promo2 + PromoInterval + scale(Promo2Tenure) + Promo2Begun + StateHoliday + SchoolHoliday + StoreType + Assortment + MeanSales)
+
+predictions_model_03 <- predict(linear_model_03, validateSet)
+lm03_rmspe = rmspe(predictions_model_03, validateSet$Sales)
+print(lm03_rmspe)
+```
+
+A RMSPE = 0.27 is acheived using median sales of the store.
+
+We can compare the predicted sales and actual sales in the validation set with a plot.
+```{r, echo=FALSE}
+ggplot(mapping=aes(y=predictions_model_03, x=validateSet$Sales)) +
+  stat_binhex(binwidth = c(1000, 1000), color='gray50') +
+  geom_abline(slope=1, intercept=0, color='red', alpha=0.85) +
+  coord_fixed(ratio=1) +
+  xlab("Validation Set Sales") +
+  ylab("Predicted Sales") +
+  ggtitle("Linear Model 03")
+```
+
+
+### Decision Tree
+It is possible our decision boundaries are not linear.  A Decision tree may be a more appropriate choice.  Lets build one and see. Default parameters include complexity parameter (cp) = 0.01, minsplit = 20, minbucket = minsplit/3, maxdepth=30.
+
+```{r}
+dt_params = rpart.control(minsplit=21, minbucket=7, cp=0.001)
+dt_model_01 <- rpart(data = trainingSet, 
+                     control = dt_params,
+                  formula = Sales ~ DayOfWeek + Date.Month + Date.DayOfMonth + Promo + LogCompetitionDistance + CompetitionTenure + CompetitionOpened + Promo2 + PromoInterval + Promo2Tenure + Promo2Begun + StateHoliday + SchoolHoliday + StoreType + Assortment + MeanSales)
+
+#summary(dt_model_01)
+rpart.plot(dt_model_01, varlen=0, faclen=0)
+
+predictions_dt_model_01 <- predict(dt_model_01, validateSet)
+dt01_rmspe = rmspe(predictions_dt_model_01, validateSet$Sales)
+print(dt01_rmspe)
+```
+
+The simple decision tree model has a RMSPE = 0.28, which is comparable to the linear model.  The decision tree chooses only Promo and MeanSales for splitting the data.
+
+
+### Random Forest
+
+Random forest will run multiple decision trees with each split sampling from different data points and different features.  This will hopefully yeield a more valid model.  Random forest requires more computation time, but does not run the risk of overfitting.  We will use a subset of the trainingSet in order to decrease our training time.
+
+The default parameters include the number of trees to combine = 500, the number of features to try at each split = param/3, and the minimum size of nodes = 5.  Random Forest does not accept categories with more than 52 levels (1,115 levels in Store), so we will use MeanSales instead of Store.
+```{r}
+tiny_trainingSet <- sample(trainingSet, 50000)
+```
+
+```{r}
+start_time <- Sys.time()
+rf_model_01 <- randomForest(Sales ~ DayOfWeek + Date.Month + Date.DayOfMonth + Promo + LogCompetitionDistance + CompetitionTenure + CompetitionOpened + Promo2 + PromoInterval + Promo2Tenure + Promo2Begun + StateHoliday + SchoolHoliday + StoreType + Assortment + MeanSales,
+                            data = tiny_trainingSet,
+                            importance = TRUE,
+                            ntree=200,
+                            nodesize=100)
+run_time <- Sys.time() - start_time
+print(run_time)
+print(rf_model_01)
+```
+
+```{r}
+# Model performance
+predictions_rf_model_01 <- predict(rf_model_01, validateSet)
+rf01_rmspe = rmspe(predictions_rf_model_01, validateSet$Sales)
+print(rf01_rmspe)
+```
+For the random forest model with 200 trees, running on a subset of the training data (50,000 rows), we acheieved RMPSE = 0.26.  Reducing nodesize would be ideal, but we are limited in computation time.  Let's look at the feature importance for the random forest model.
+
+```{r}
+# Feature importance
+imp = importance(rf_model_01, type=1)
+imp = data.frame(Feature=row.names(imp), Importance=imp[,1])
+print(imp)
+```
+```{r, echo=FALSE, message=FALSE}
+ggplot(aes(x=reorder(Feature, Importance), y=Importance), data=imp) +
+  geom_bar(stat="identity", fill="dodgerblue") +
+  xlab("") +
+  coord_flip()
+```
+Whether or not a store has a promotion that day seems to be the most important feature.  As expected, the mean sales of a particular store is also an important feature for correctly predicting sales, as are the date information, and how long the competitor has been around.
+
+
+### Boosting Tree
+Lets include one more model, a, eXtreme Gradient Boosting tree.  Gradient Boosting Decision Trees (GBDT) have more tuninging parameters, and are prone to overfitting (unlike Random Forest), but has potential to build a better model.  We are using default params for now, including learning rate = 0.3, max.depth =  6, subsample = 1, colsample = 1, min child weight = 1.  
+
+```{r}
+# build matricies
+#names(trainingSet)
+feature_idx = c(3, 6:10, 12:18, 20:22) # includes MedianSales
+print(names(trainingSet)[feature_idx])
+
+trainMatrix <- xgb.DMatrix(data=data.matrix(trainingSet[,feature_idx]), label=trainingSet$Sales, missing=NA)
+validateMatrix <- xgb.DMatrix(data=data.matrix(validateSet[,feature_idx]), label=validateSet$Sales, missing=NA)
+holdoutMatrix <- xgb.DMatrix(data=data.matrix(holdoutSet[,feature_idx]), label=holdoutSet$Sales, missing=NA)
+```
+
+```{r}
+# set params
+param = list(objective="reg:linear", eta=0.3, max.depth=6)
+
+# train model
+start_time <- Sys.time()
+xgb_01_model <- xgb.train(params=param, data=trainMatrix, nrounds=60)
+run_time <- Sys.time() - start_time
+print(run_time)
+
+# evaluation
+xgb_01_predictions <- predict(xgb_01_model, validateMatrix)
+xgb_01_rmspe = rmspe(xgb_01_predictions, validateSet$Sales)
+print(xgb_01_rmspe)
+```
+
+With only 60 rounds of the xgb model on the full training set, we already achieve a validation RMPSE = 0.253.  We'll now try tuning the parameters to improve this score.
+
+
+```{r}
+xgb_perf = data.frame(nrounds = rep(80, 4), 
+                      eta = c(0.001, 0.01, 0.1, 1.0), 
+                      max_depth = rep(6, 4), 
+                      time = rep(0, 4), 
+                      rmspe = rep(0, 4) )
+
+for (i in 1:4) {
+  param = list(objective="reg:linear", eta=xgb_perf$eta[i], max.depth=xgb_perf$max_depth[i])
+  
+  start_time <- Sys.time()
+  this_xgb_model <- xgb.train(params=param, data=trainMatrix, nrounds=xgb_perf$nrounds[i])
+  run_time = (Sys.time() - start_time)
+  
+  this_xgb_pred <- predict(this_xgb_model, validateMatrix)
+  this_xgb_rmspe = rmspe(this_xgb_pred, validateSet$Sales)
+  print(c('eta', xgb_perf$eta[i], 'rmspe', this_xgb_rmspe))
+  xgb_perf$time[i] = as.numeric(run_time, units="secs")
+  xgb_perf$rmspe[i] = this_xgb_rmspe
+}
+```
+
+Holding max_depth constant and nrounds=80, the eta that minimizes RMSPE is 1.0.  For smaller eta, the learning rate is slow, so a larger number of rounds is necessary to maintain a small RMSPE.  We will now run xgb models with slow learning (0.1) and many rounds.
+
+
+```{r, message=FALSE}
+xgb_perf = data.frame(nrounds = c(10, 50, 100, 400, 800),
+                      eta = rep(0.1, 5), 
+                      max_depth = rep(10, 5), 
+                      time = rep(0, 5), 
+                      rmspe = rep(0, 5) )
+
+for (i in 1:5) {
+  param = list(objective="reg:linear", eta=xgb_perf$eta[i], max.depth=10, subsample=0.85, colsample_bytree=0.4)
+  
+  start_time <- Sys.time()
+  this_xgb_model <- xgb.train(params=param, data=trainMatrix, nrounds=xgb_perf$nrounds[i])
+  run_time = (Sys.time() - start_time)
+  
+  this_xgb_pred <- predict(this_xgb_model, validateMatrix)
+  this_xgb_rmspe = rmspe(this_xgb_pred, validateSet$Sales)
+  print(c('nrounds', xgb_perf$nrounds[i], 'rmspe', this_xgb_rmspe))
+  xgb_perf$time[i] = as.numeric(run_time, units="secs")
+  xgb_perf$rmspe[i] = this_xgb_rmspe
+}
+```
+
+```{r, echo=FALSE}
+ggplot(aes(x=nrounds, y=rmspe), data=xgb_perf) +
+  geom_smooth() +
+  geom_point(size=4) +
+  xlab("Number of Rounds") +
+  ylab("RMSPE") +
+  ggtitle("xgb Model (eta=0.01)")
+```
+
+It appears that the RMSPE has not reached a minimum, and at 800 rounds the RMSPE = 0.231.  We could run the tree further, but in the interest in time, we will leave it as it is.
+
+Finally, we can compare the results of our models with our self-made holdout set.
+```{r}
+# Evaluate on holdout set
+final_xgb_pred <- predict(this_xgb_model, holdoutMatrix)
+final_xgb_rmspe = rmspe(final_xgb_pred, holdoutSet$Sales)
+print(final_xgb_rmspe)
+```
+We retain a RMSPE = 0.30 for the xgboost model.
+
+```{r, echo=FALSE}
+ggplot(mapping=aes(x=holdoutSet$Sales, y=final_xgb_pred)) +
+  stat_binhex(binwidth = c(1000, 1000), color='gray50') +
+  scale_fill_gradient(breaks=seq(0, 10000, 1000)) +
+  geom_abline(slope=1, intercept=0, color='red', alpha=0.75) +
+  coord_fixed(ratio=1) +
+  xlab("Holdout Set Sales") +
+  ylab("Predicted Sales") +
+  ggtitle("xgb model")
+```
+
+```{r, message=FALSE}
+# Linear model and holdout comparison
+predictions_model_03 <- predict(linear_model_03, holdoutSet)
+print(rmspe(predictions_model_03, holdoutSet$Sales))
+```
+The linear model achieves RMSPE = 0.33 for the holdout set.
+
+```{r}
+# random forest model and holdout comparison
+predictions_rf_model_01 <- predict(rf_model_01, holdoutSet)
+print(rmspe(predictions_rf_model_01, holdoutSet$Sales))
+```
+The random forest model achieves RMSPE = 0.32 for the holdout set.
+
+
+***
+Conclusion
+====================
+
+The best model from this work, in terms of RMSPE on the holdout set, was the xgboost model. It is likely that the tree parameters could be tuned better, and certainly the xgboost model could be run longer.  Incorporating k-fold cross-validation would help prevent overfitting and yield a more consistent result with the holdout set.  Additionally, the MeanSales figures were artifically lowering RMSPE in the validate set, since Sales values in the validation set went into the calculations of MeanSales.  Forecasting future sales would certainly want to incorporate a MeanSales feature though.  Another feature that would be useful to add is whether or not the current Date of an observation coincides with the PromoInterval month for that store.
